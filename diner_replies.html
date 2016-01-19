@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html>
+<title>K-means clustering for analysis of diner replies</title>
+
+<xmp theme="united" style="display:none;">
+
+# K-means clustering for analysis of diner replies
+*Stephen Spalding*
+
+## Introduction
+One of the features that we support is waitlist texting.
+When someone gets on the waitlist, instead of a buzzing coaster the restaurant takes their phone number and sends a text message when their table is ready.
+The automated text message informs the diner:
+
+    "Please make your way back to the host stand. Your table will be ready soon. Text '1' to tell us you are on your way. Text '9' to cancel."
+
+Generally, diners respond either 1 or 9 to respectively confirm or cancel their reservation.
+Occasionally, however, diners respond with something else.
+Only about 2% of replies are anything besides 1 or 9, but at OpenTable's scale, this small percentage translates into thousands or diners.
+
+We would like to gain some more insight into what sorts of things diners would like to communicate to restaurants.
+One way to do this would be to manually sift through thousands of text replies.
+It is possible, however, to use machine learning algorithms to automatically sort replies in groups of similar messages.
+We will do this by using a [K-means clustering](https://en.wikipedia.org/wiki/K-means_clustering) algorithm.
+
+## Overview
+
+Our classification task can be split into several steps.
+
+ 1. Collect data
+ 2. Prepare/normalize data
+ 3. Calculate N-gram frequency
+ 4. Make feature vectors
+ 5. Reduce feature space using PCA 
+ 6. Perform K-means clustering
+ 7. Analyze results
+
+We will be using clojure to process our data and implement the K-means clustering algorithm.
+
+## 1. Collect Data
+
+Our messages are stored in a PostgreSQL database, so we will build a query to retrieve the diner replies.
+
+We want:
+
+  - unique replies (only example one of each type)
+  - replies only to "your table is ready" messages.
+
+Here is the clojure code we'll use to retrieve these messages:
+
+    (defn template-replies-query [template page]
+        (->>
+            (k/exec-raw
+                ["SELECT DISTINCT(m.body) as body FROM message AS m, message AS o WHERE m.inreplyto=o.id AND m.template isnull AND o.template = 'text:walkin:ready' AND m.body NOTNULL LIMIT 1000 OFFSET ?" [(* page 1e3)]]
+                :results)
+            (map #(-> % :body message-clean))))
+
+    (defn get-table-ready-replies []
+    (->> (pmap #(template-replies-query "test:walkin:ready" %) (range 1e3))
+        (take-while #(seq %))
+        (map set)
+        (apply clojure.set/union)))
+
+    (def msgs (get-table-ready-replies))
+
+## 2. Prepare/normalize data
+
+We need to clean up our data a bit after we retrieve it.
+
+    (defn message-clean [body]
+        (-> body
+            (s/replace #"\s+" " ")
+            (s/replace #"[^\w\n']+" " ")
+            (s/lower-case)
+            (s/trim)))
+
+Mainly, this will:
+
+- Remove symbols and extra whitespace
+- Convert all words to lower case
+
+## 3. Calculate N-gram frequency
+
+An n-gram is simply a set of words. A 1-gram is a single word, 2-gram, a pair, etc.
+The primary feature that we will use is the prevalence of n-grams in a phrase.
+To limit our feature space, we will first limit ourselves to the 100 most frequent n-grams. In order to do this, we will find all of the unique n-grams in our message bodies and count the frequencies of each.
+
+    (defn count-n-grams
+        "Calculate frequencies for all n-grams in a line-seq"
+        [n lines]
+        (-<> (s/join "\n" lines)
+            (s/split #"\s")
+            (partition n <>)
+            (map #(s/join "_" %) <>)
+            frequencies))
+
+Using the frequency count, we can order our n-grams by frequency and take just the first 100.
+
+    (def n-grams
+        "n-gram frequencies"
+        (->> [(count-n-grams 1 msgs)
+                ;; (count-n-grams 2 "diner_replies_clean.txt")
+                ]
+        (apply merge)
+        (into-priority-map)
+        ;; (drop 10)
+        (take 100)
+        keys))
+
+We ended up using just unigrams for this dataset. Adding 2- and 3-grams created redundancy in our features that made the PCA (explained in the next section) unable to converge.
+Also, we experimented with removing the 10 most frequent words. This turned to be unnecessary for this dataset.
+
+## 4. Make feature vectors
+
+Once we have determined out n-gram list, we can create a feature vector for each message.
+The feature vector is simply a set of 1's and 0's corresponding to whether a given n-gram is present in the message.
+
+    (defn feature-vec
+        "feature vector for a string using supplied n-grams"
+        [n-grams s]
+        (let [words (-> s (s/split #"\s") set)]
+            (mapv #(if (words %) 1 0) n-grams)))
+
+The set of feature vectors are then stored in a matrix for further processing.
+Since we are using the incanter clojure library, our matrix will be stored as a Clatrix datatype with allows matrix operations to be performed using native BLAS hooks.
+BLAS (Basic Linear Algebra Subprograms) is a set of optimized Fortran routines which means that out matrix operations will be fast.
+
+    (def X
+        (->> msgs
+            (map (partial feature-vec n-grams))
+            matrix))
+
+## 5. Reduce feature space using PCA
+
+We now have 100 features for each message. We would like to reduce this number for two reasons:
+
+ - visualization
+ - processing time
+
+The first step to reducing our features is to perform [Principal Component Analysis](https://en.wikipedia.org/wiki/Principal_component_analysis).
+
+    (defn reduce-features
+        "Projects Matrix X into dimension n using given PCA"
+        [X pca n]
+        (-<> pca
+            :rotation
+            (m/sel :cols (range n))
+            (m/mmult X <>)))
+
+    (def pca (principal-components X))
+
+Once we have performed PCA, we can reduce the number of features to 2 in order to visualize our dataset.
+
+    (defn visualize [x pca & [groups]]
+        (let [x2 (reduce-features x pca 2)
+                [x1 x2] (map #(m/sel x2 :cols %) [0 1])]
+            (m/view (charts/scatter-plot x1 x2
+                                        :group-by groups
+                                        :x-label "pc1"
+                                        :y-label "pc2"
+                                        :title "message groups"))))
+
+Reducing our features to two dimensions allows us to map all of our messages onto a 2D plane.
+To get some initial insight into our data, we will mark all replies that include a "9".
+Messages that include a 9 should be some sort of cancel message, so this will give us an idea of where "cancel" messages lie.
+
+    (visualize X pca (m/sel X :cols (.indexOf n-grams "9")))
+
+![Press 9 to cancel](diner_replies_pca_9.png "Visualization of Messages in 2D feature space: replies containing '9'")
+
+Now we do the same visualization, but marking replies that include a "1".
+This gives us a rough idea of which region "confirm"-like messages should lie in.
+
+    (visualize X pca (m/sel X :cols (.indexOf n-grams "1")))
+
+![Press 1 to confirm](diner_replies_pca_1.png "Visualization of Messages in 2D feature space: replies containing '1'")
+
+For K-means clustering, we will reduce the features to 60.
+This will maintain most of our feature entropy while reducing the computation time required for K-means clustering.
+
+    (def X-reduced (reduce-features X pca 60))
+
+## 6. Perform K-means clustering
+
+First, we define a few helper functions:
+
+    (defn index-of [coll value]
+        (loop [i 0]
+            (if (= value (nth coll i))
+            i
+            (recur (inc i)))))
+
+    (defn indices-of [coll value]
+        (for [i (range (count coll)) :when (= value (nth coll i))] i))
+
+    (defn eye "identity matrix" [n] (m/diag (repeat n 1)))
+
+    (defn euclid-dist [x centroids]
+        (-<> x
+            (stats/mahalanobis-distance
+                :centroid (m/trans centroids)
+                :W (eye (m/ncol x)))
+            (map #(m/sel % 0 0) <>) ;; Otherwise, this returns 1x1 mats
+            matrix))
+
+Finally, we present our K-means function:
+
+    (defn k-means
+        ([data k & {:keys [max-iterations] :or [max-iterations 1000]}]
+        (let [t0 (System/currentTimeMillis)
+                p (m/ncol data)
+                W (m/diag (repeat p 1))
+                dist (partial euclid-dist data)
+                n (m/nrow data)]
+            (loop [centroids (stats/sample data :size k)
+                    last-members nil
+                    member-indices nil
+                    i 0]
+            (println "iter:" i)
+            (let [last-members member-indices
+                    dist-vec (map dist centroids)
+                    dist-mat (m/trans dist-vec)
+                    member-indices (map #(index-of % (apply min %)) dist-mat)
+                    cluster-indices (map (fn [idx] 
+                                            (indices-of member-indices idx))
+                                        (range k))
+                    centroids (matrix (map #(map stats/mean (m/trans (m/sel data :rows %)) )
+                                            cluster-indices))
+                    cost (/ (r/fold + (r/map #(apply min %) dist-mat)) n)]
+                (println "cost:" cost)
+                (if (or (= member-indices last-members)
+                        (= i max-iterations))
+                {:dist-matrix dist-mat
+                    :cluster-indices cluster-indices
+                    :centroids centroids
+                    :member-indices member-indices
+                    :iterations i
+                    :cost cost
+                    :time (quot (- (System/currentTimeMillis) t0) 1000)}
+                (recur centroids last-members member-indices (inc i))))))))
+
+The purpose of the K-means algorithm is to group all of the data points into K groups, based on their similarities across the given features.
+                There are more in-depth resources available about the K-means algorithm, but principally, we iterate on three steps:
+
+0) First, randomly choose K points as group centroids.
+1) Calculate the euclidean distance of each datapoint from each of the K group centroids.
+2) For each datapoint, take the minimum of these distances, and assign each datapoint to its closest group.
+3) Reposition the cetroids to be the center of mass of the assigned datapoints.
+
+We continue steps 1-3 until the sets of datapoints assigned to each centroid stops changing.
+
+    (defn- least-cost
+        ([] {:cost 1e9})
+        ([a] a)
+        ([a b] (if (< (:cost a) (:cost b)) a b)))
+
+    (defn k-means-multi [X k n]
+        "Perform k-means multiple times and take best result"
+        (->> (range n)
+            (pmap (fn [_] (k-means X k)))
+            (r/fold 2 least-cost least-cost)))
+
+The K-means algorithm is particularly susceptible to finding local minima.
+In order to mitigate this, we run the algorithm several times in parallel and take the "best" result.
+We define "best" as the result with the least cost, meaning the sum of the distances between datapoints and centroids is least.
+
+    (def clusters (k-means-multi X-reduced 3 10))
+
+We used the above functions to perform K-means on our data with K=3 and plotted the results.
+
+![3 clusters](diner_replies_k3.png "Visualization of Clusters in 2D feature space: K=3")
+
+## 7. Analyze results
+Now that we have divided our messages into three clusters, let's take a look at each of the clusters and see if we can find some commonalities.
+Remember, that these clusters have been formed solely on message feature similarity.
+We did not provide any a-priori labels for our data.
+
+### Cluster 1
+For each of our three clusters, we have generated word clouds from commonly occurring words, as well as randomly selected a few representative example messages.
+![Cluster 1 wordcloud](diner_replies_wordcloud1.svg)
+
+*Example messages:*
+
+    we are all set we are at a different location thank yo life
+    1 we at ihop now fam
+    we are seated on the patio
+    we r getting the tab
+    can we delay 15m
+    we are heading inside
+    we are on route
+    we are at race and green
+    can we seat 5
+    sorry we are at butchers
+
+We can see in the word cloud and the example messages, these seem to be centered around "We are doing X".
+Usually this implies that a table is no longer needed.
+
+### Cluster 2
+![Cluster 2 wordcloud](diner_replies_wordcloud2.svg)
+
+*Example messages:*
+
+    will be there soon
+    k be right there
+    we wil be there shortly
+    great be there in a few minutes
+    be there in 1 minute
+    be there in a few
+    1 we will be there at 715
+    1 be there asap
+    we will be there at 6 30
+    we will be with you in 15mins
+
+These messages seem to be centered around "we will be there in  a jiffy".
+These seem to fairly reliably be confirmations.
+
+### Cluster 3
+![Cluster 3 wordcloud](diner_replies_wordcloud3.svg)
+
+*Example messages:*
+
+    qe
+    hello
+    awesome
+    2pll2 io0 g e
+    wi gat tabel
+    eta 5min
+    yeah
+    one minute
+    grande orange
+    99
+
+This group is much more difficult to characterize.
+Most are single word replies.
+Some are decipherable for a human, but difficult for our algorithm to make sense of since they contain unique wording.
+"wi gat tabel" is a prime example of this.
+A human might be able to decipher that this says "We got table", which probably means "We have a table already, thanks." which we could chalk down as a cancel, or 9.
+The problem for our algorithm is that this diner found a completely unique way to express "9".
+
+Despite the presence of clear outliers, we are able to see common elements in our three clusters.
+Roughly, we can characterize them as "cancel", "confirm", and "?".
+
+## Further work
+
+We can improve our k-means be providing better features from our messages.
+Word vectors may be used to correlate synonyms and similar words.
+Additionally, K-means could be performed for larger K values to discover more specific groups of replies.
+
+As a next step in analyzing replies, a supervised algorithm could be used.
+K-means is an unsupervised algorithm, meaning we can use it to gain insight into our data even without providing any specific guidance.
+If we manually label a subset of our data, we could use supervised algorithms to gain further insight.
+Once we've identified several response categories, we can tag some examples from each category. 
+This will allow us to more accurately classify messages into these categories and determine how prevalent each type or message is.
+
+
+</xmp>
+
+<script src="http://strapdownjs.com/v/0.2/strapdown.js"></script>
+</html>
